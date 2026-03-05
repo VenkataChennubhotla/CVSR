@@ -1367,8 +1367,9 @@ def build_llm_payload(
     referenced_tables: List[str],
     plan_summary: Dict[str, Any],
     plan_warnings: List[str],
+    table_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "mode": mode,
         "query": query,
         "server_info": server_info,
@@ -1378,6 +1379,9 @@ def build_llm_payload(
         "plan_warnings": plan_warnings,
         "rules": {"do_not_suggest_sys_indexes": True},
     }
+    if table_diagnostics:
+        payload["table_diagnostics"] = table_diagnostics
+    return payload
 
 
 def build_prompt(payload: Dict[str, Any], lang: str) -> str:
@@ -1386,8 +1390,25 @@ def build_prompt(payload: Dict[str, Any], lang: str) -> str:
     - Forces summary to be non-empty
     - Forces JSON-only (no markdown fences)
     - Ensures some useful content even when no issues are found
+    - Provides table-mode specific analysis instructions when table_diagnostics is present
     """
     lang_line = "Write in English." if lang.lower().startswith("en") else "Write in the user's language."
+    mode = payload.get("mode", "")
+
+    table_instructions = ""
+    if mode == "table" and payload.get("table_diagnostics"):
+        table_instructions = """
+Table analysis guidance (mode=table):
+- Examine "table_diagnostics" in the input JSON. It contains per-table data:
+  * "size": row_count, total_mb, used_mb, unused_mb — flag tables with high unused space.
+  * "fragmentation": per-index avg_fragmentation_in_percent and page_count — only act on indexes with page_count > 1000; for those, above 30% fragmentation needs REBUILD, 10-30% needs REORGANIZE; ignore high fragmentation on low page_count (< 1000 pages) as it rarely impacts performance.
+  * "index_usage": seeks, scans, lookups, updates, last_user_seek — indexes with 0 seeks/scans/lookups but high updates are unused overhead (candidates for removal).
+  * "statistics": modification_counter relative to rows — high ratios mean stale statistics (UPDATE STATISTICS needed).
+- Provide concrete, actionable index_suggestions (REBUILD/REORGANIZE/DROP) referencing specific index names and fragmentation values.
+- Identify any statistics that are stale and recommend UPDATE STATISTICS with the specific stat names.
+- Comment on unused indexes explicitly by name.
+"""
+
     return f"""
 You are a senior Microsoft SQL Server performance engineer. {lang_line}
 
@@ -1400,7 +1421,8 @@ Hard requirements:
 - "top_issues" MUST be an array (can be empty).
 - "recommendations" MUST be an array (can be empty).
 - "rewrite_suggestion" can be null.
-
+- "index_suggestions" MUST be an array of objects with keys "index_name", "action" (REBUILD/REORGANIZE/DROP/NONE), "reason".
+{table_instructions}
 Input JSON:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
@@ -1559,7 +1581,7 @@ def no_user_flags(argv: List[str]) -> bool:
 def run_once(argv: List[str]) -> bool:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", default="en")
-    ap.add_argument("--predict", type=int, default=2500)
+    ap.add_argument("--predict", type=int, default=3500)
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--no-ai", action="store_true", help="Skip Ollama call")
     ap.add_argument("--plan-out", default="", help="Write estimated plan XML to file (query mode)")
@@ -1661,6 +1683,7 @@ def run_once(argv: List[str]) -> bool:
     plan_warnings: List[str] = []
     referenced_tables: List[str] = []
     server_info: Dict[str, Any] = {}
+    db_state: Dict[str, Any] = {}
 
     with connect() as conn:
         cur = conn.cursor()
@@ -1813,6 +1836,7 @@ def run_once(argv: List[str]) -> bool:
                     referenced_tables=referenced_tables,
                     plan_summary=plan_summary,
                     plan_warnings=plan_warnings,
+                    table_diagnostics=db_state if mode == "table" else None,
                 )
                 prompt = build_prompt(ai_payload, args.lang)
                 ai = call_ollama_json(prompt, num_predict=args.predict, debug=args.debug)
