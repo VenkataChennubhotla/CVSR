@@ -38,6 +38,14 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b").strip()
 
 MAX_SQL_CHARS = 12000
 
+# Fragmentation thresholds (pages must exceed MIN_PAGES_FOR_FRAG_ACTION before acting)
+FRAG_REBUILD_PCT = 30
+FRAG_REORGANIZE_PCT = 10
+MIN_PAGES_FOR_FRAG_ACTION = 1000
+
+# Decimal places for estimated subtree cost in the plan outline
+COST_DECIMAL_PLACES = 5
+
 
 # =========================
 # Connection string helpers
@@ -329,12 +337,21 @@ def sanitize_plan_text(s: str) -> str:
     return s.strip()
 
 
+def _local_tag(tag: str) -> str:
+    """Return the local (non-namespaced) part of an lxml element tag string."""
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
 def _xml_root(xml_text: str) -> Optional[etree._Element]:
     if not xml_text:
         return None
     try:
+        # Strip the XML declaration before re-encoding to UTF-8 bytes.
+        # SQL Server often emits encoding="utf-16"; keeping it causes lxml to
+        # reject the UTF-8 encoded bytes due to the declaration mismatch.
+        clean = re.sub(r"<\?xml\b[^?]*\?>", "", xml_text, count=1).lstrip()
         parser = etree.XMLParser(remove_blank_text=True, recover=True)
-        return etree.fromstring(xml_text.encode("utf-8", errors="ignore"), parser=parser)
+        return etree.fromstring(clean.encode("utf-8", errors="ignore"), parser=parser)
     except Exception:
         return None
 
@@ -360,7 +377,12 @@ def plan_operator_outline(plan_xml: Optional[str], max_ops: int = 60) -> List[Li
     rows = []
     relops = root.xpath("//*[local-name()='RelOp']")
     for ro in relops[:max_ops]:
-        rows.append([ro.get("PhysicalOp"), ro.get("LogicalOp"), ro.get("EstimateRows")])
+        cost_raw = ro.get("EstimatedTotalSubtreeCost")
+        try:
+            cost = round(float(cost_raw), COST_DECIMAL_PLACES) if cost_raw is not None else None
+        except (ValueError, TypeError):
+            cost = cost_raw
+        rows.append([ro.get("PhysicalOp"), ro.get("LogicalOp"), ro.get("EstimateRows"), cost])
     return rows
 
 
@@ -411,14 +433,47 @@ def extract_plan_warnings(plan_xml: Optional[str], max_items: int = 50) -> List[
     if root is None:
         return []
     warnings: List[str] = []
+
+    # Known warning child element handlers
+    def _handle_child(child: Any) -> Optional[str]:
+        tag = _local_tag(child.tag)
+        if tag == "PlanAffectingConvert":
+            issue = child.get("ConvertIssue") or ""
+            expr = child.get("Expression") or ""
+            parts = [p for p in [issue, expr] if p]
+            return f"PlanAffectingConvert: {' -- '.join(parts)}" if parts else "PlanAffectingConvert"
+        if tag == "NoJoinPredicate":
+            return "NoJoinPredicate: Join has no predicate (possible cross-join / missing WHERE clause)."
+        if tag == "SpillOccurred":
+            return "SpillOccurred: Memory spill to TempDB detected -- consider increasing memory grant or tuning query."
+        if tag == "HashSpillDetails":
+            return "HashSpillDetails: Hash spill to TempDB -- review memory grant size."
+        if tag == "SortSpillDetails":
+            return "SortSpillDetails: Sort spill to TempDB -- review memory grant size."
+        if tag == "MemoryGrantWarning":
+            kind = child.get("GrantWarningKind") or ""
+            return f"MemoryGrantWarning: {kind}" if kind else "MemoryGrantWarning"
+        if tag == "WaitWarning":
+            wait_type = child.get("WaitType") or ""
+            wait_ms = child.get("WaitTime") or ""
+            return f"WaitWarning: type={wait_type} time_ms={wait_ms}"
+        if tag == "UnmatchedIndexes":
+            return "UnmatchedIndexes: Query has hints referencing indexes that could not be matched."
+        # Generic fallback: emit key=value pairs from attributes (no raw XML serialisation)
+        text_parts = [f"{_local_tag(k)}={v}" for k, v in child.attrib.items()]
+        if text_parts:
+            return f"{tag}: {', '.join(text_parts)}"
+        inner = (child.text or "").strip()
+        if inner:
+            return f"{tag}: {inner}"
+        return None
+
     for w in root.xpath("//*[local-name()='Warnings']"):
-        txt = etree.tostring(w, encoding="unicode")
-        if txt:
-            warnings.append(re.sub(r"\s+", " ", txt).strip())
-    for pac in root.xpath("//*[local-name()='PlanAffectingConvert']"):
-        expr = pac.get("Expression") or ""
-        data_type = pac.get("ConvertIssue") or ""
-        warnings.append(f"PlanAffectingConvert: {data_type} {expr}".strip())
+        for child in w:
+            msg = _handle_child(child)
+            if msg:
+                warnings.append(msg)
+
     seen = set()
     out = []
     for s in warnings:
@@ -1397,13 +1452,16 @@ def build_prompt(payload: Dict[str, Any], lang: str) -> str:
 
     table_instructions = ""
     if mode == "table" and payload.get("table_diagnostics"):
-        table_instructions = """
+        table_instructions = f"""
 Table analysis guidance (mode=table):
 - Examine "table_diagnostics" in the input JSON. It contains per-table data:
-  * "size": row_count, total_mb, used_mb, unused_mb — flag tables with high unused space.
-  * "fragmentation": per-index avg_fragmentation_in_percent and page_count — only act on indexes with page_count > 1000; for those, above 30% fragmentation needs REBUILD, 10-30% needs REORGANIZE; ignore high fragmentation on low page_count (< 1000 pages) as it rarely impacts performance.
-  * "index_usage": seeks, scans, lookups, updates, last_user_seek — indexes with 0 seeks/scans/lookups but high updates are unused overhead (candidates for removal).
-  * "statistics": modification_counter relative to rows — high ratios mean stale statistics (UPDATE STATISTICS needed).
+  * "size": row_count, total_mb, used_mb, unused_mb -- flag tables with high unused space.
+  * "fragmentation": per-index avg_fragmentation_in_percent and page_count -- only act on indexes \
+with page_count > {MIN_PAGES_FOR_FRAG_ACTION}; for those, above {FRAG_REBUILD_PCT}% fragmentation \
+needs REBUILD, {FRAG_REORGANIZE_PCT}-{FRAG_REBUILD_PCT}% needs REORGANIZE; ignore high fragmentation \
+on low page_count (< {MIN_PAGES_FOR_FRAG_ACTION} pages) as it rarely impacts performance.
+  * "index_usage": seeks, scans, lookups, updates, last_user_seek -- indexes with 0 seeks/scans/lookups but high updates are unused overhead (candidates for removal).
+  * "statistics": modification_counter relative to rows -- high ratios mean stale statistics (UPDATE STATISTICS needed).
 - Provide concrete, actionable index_suggestions (REBUILD/REORGANIZE/DROP) referencing specific index names and fragmentation values.
 - Identify any statistics that are stale and recommend UPDATE STATISTICS with the specific stat names.
 - Comment on unused indexes explicitly by name.
@@ -1484,6 +1542,7 @@ def _normalize_ai_result(ai: Dict[str, Any], mode: str, fallback_query_type: str
     Updated normalization:
     - Still ensures query_type always present
     - If LLM summary is empty, we generate a deterministic fallback summary so the tool is always useful.
+    - Ensures array fields (top_issues, recommendations, index_suggestions) are always lists.
     """
     if not isinstance(ai, dict):
         ai = {}
@@ -1506,6 +1565,11 @@ def _normalize_ai_result(ai: Dict[str, Any], mode: str, fallback_query_type: str
             f"Fallback: review the diagnostics tables above; focus on fragmentation recommendations, stats modification ratios, "
             f"unused-index candidates, I/O latency warnings, top waits, TempDB sizing, and backup recency."
         )
+
+    # Ensure array fields are always lists so downstream code can iterate safely
+    for array_field in ("top_issues", "recommendations", "index_suggestions", "safety_warnings", "questions"):
+        if not isinstance(ai.get(array_field), list):
+            ai[array_field] = []
 
     ai["query_type"] = qt
     ai["summary"] = summ
@@ -1581,7 +1645,8 @@ def no_user_flags(argv: List[str]) -> bool:
 def run_once(argv: List[str]) -> bool:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", default="en")
-    ap.add_argument("--predict", type=int, default=3500)
+    ap.add_argument("--predict", type=int, default=3500,
+                    help="Max tokens for Ollama response (increased to 3500 to handle richer table diagnostics payloads)")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--no-ai", action="store_true", help="Skip Ollama call")
     ap.add_argument("--plan-out", default="", help="Write estimated plan XML to file (query mode)")
@@ -1717,7 +1782,7 @@ def run_once(argv: List[str]) -> bool:
                     ],
                 )
             )
-            sections.append(("Plan operator outline (first 60)", ["physical_op", "logical_op", "estimate_rows"], plan_outline_rows))
+            sections.append(("Plan operator outline (first 60)", ["physical_op", "logical_op", "estimate_rows", "est_subtree_cost"], plan_outline_rows))
             sections.append(("Plan warnings", ["warning"], [[w] for w in plan_warnings]))
             sections.append(("Referenced tables (from plan)", ["table"], [[t] for t in referenced_tables]))
 
@@ -1773,7 +1838,7 @@ def run_once(argv: List[str]) -> bool:
                     ],
                 )
             )
-            sections.append(("Plan operator outline (first 60)", ["physical_op", "logical_op", "estimate_rows"], plan_outline_rows))
+            sections.append(("Plan operator outline (first 60)", ["physical_op", "logical_op", "estimate_rows", "est_subtree_cost"], plan_outline_rows))
             sections.append(("Plan warnings", ["warning"], [[w] for w in plan_warnings]))
             sections.append(("Referenced tables (from plan)", ["table"], [[t] for t in referenced_tables]))
 
