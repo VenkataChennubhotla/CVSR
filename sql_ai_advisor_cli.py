@@ -46,6 +46,17 @@ MIN_PAGES_FOR_FRAG_ACTION = 1000
 # Decimal places for estimated subtree cost in the plan outline
 COST_DECIMAL_PLACES = 5
 
+# SQL keywords that cannot be table names (used by extract_tables_from_sql)
+_SQL_KEYWORD_BLACKLIST = frozenset({
+    "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER",
+    "CROSS", "APPLY", "ON", "AND", "OR", "NOT", "IN", "IS", "NULL", "AS", "SET",
+    "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "HAVING", "GROUP",
+    "ORDER", "BY", "TOP", "DISTINCT", "WITH", "TABLE", "VIEW", "INDEX", "DATABASE",
+    "SCHEMA", "EXEC", "EXECUTE", "BEGIN", "END", "CASE", "WHEN", "THEN", "ELSE",
+    "RETURN", "DECLARE", "NOLOCK", "TABLOCK", "ROWLOCK", "UPDLOCK", "HOLDLOCK",
+    "READPAST", "READUNCOMMITTED", "ROWCOUNT", "NOCOUNT",
+})
+
 
 # =========================
 # Connection string helpers
@@ -509,6 +520,51 @@ def extract_referenced_objects_from_plan(plan_xml: str) -> List[Dict[str, str]]:
     return out
 
 
+def extract_tables_from_sql(sql: str) -> List[str]:
+    """
+    Regex-based fallback: extract referenced table/view names directly from SQL text.
+    Used when SHOWPLAN_XML cannot be obtained (e.g., parameter type clash).
+    Returns list of 'schema.table' strings (defaults schema to 'dbo').
+    """
+    # Strip line and block comments to avoid false matches
+    sql_clean = re.sub(r"--[^\n]*", " ", sql)
+    sql_clean = re.sub(r"/\*.*?\*/", " ", sql_clean, flags=re.DOTALL)
+
+    # Match table references after FROM / JOIN / UPDATE / INSERT INTO / MERGE [INTO]
+    # Supports optional bracket quoting: [schema].[table] or schema.table or just table
+    pattern = re.compile(
+        r"""
+        (?:FROM|JOIN|UPDATE|INTO|MERGE\s+(?:INTO\s+)?)
+        \s+
+        (?:
+            \[?([\w$#]+)\]?\s*\.\s*\[?([\w$#]+)\]?   # schema.table
+            |
+            \[?([\w$#]+)\]?                            # bare table name
+        )
+        # stop match if followed by '(' — that would be a subquery / function
+        (?!\s*\()
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    seen: set = set()
+    out: List[str] = []
+    for m in pattern.finditer(sql_clean):
+        if m.group(1) and m.group(2):
+            schema, table = m.group(1).strip("[]"), m.group(2).strip("[]")
+        elif m.group(3):
+            schema, table = "dbo", m.group(3).strip("[]")
+        else:
+            continue
+        if table.upper() in _SQL_KEYWORD_BLACKLIST:
+            continue
+        key = f"{schema}.{table}".lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(f"{schema}.{table}")
+    return out
+
+
 # =========================
 # Server info
 # =========================
@@ -814,6 +870,62 @@ def analyze_tables(cur: pyodbc.Cursor, tables: List[str]) -> Dict[str, Any]:
         entry["index_usage"] = get_index_usage(cur, schema, table)
         result["tables"].append(entry)
     return result
+
+
+def get_missing_indexes_from_dmv(cur: pyodbc.Cursor, tables: Optional[List[str]] = None) -> List[List[Any]]:
+    """
+    Query sys.dm_db_missing_index_* DMVs for the current database.
+    Returns top suggestions ordered by estimated impact.
+    When `tables` is provided (list of 'schema.table' strings), results are filtered
+    to those tables so that query-mode output stays relevant.
+    Columns: [table, equality_cols, inequality_cols, included_cols, user_seeks, user_scans, avg_impact_pct]
+    """
+    q = """
+    SELECT TOP 25
+        OBJECT_SCHEMA_NAME(d.object_id)             AS schema_name,
+        OBJECT_NAME(d.object_id)                    AS table_name,
+        d.equality_columns,
+        d.inequality_columns,
+        d.included_columns,
+        gs.unique_compiles,
+        gs.user_seeks,
+        gs.user_scans,
+        CAST(ROUND(gs.avg_user_impact, 1) AS DECIMAL(5,1)) AS avg_user_impact_pct
+    FROM sys.dm_db_missing_index_details  d
+    JOIN sys.dm_db_missing_index_groups   g  ON g.index_handle   = d.index_handle
+    JOIN sys.dm_db_missing_index_group_stats gs
+                                              ON gs.group_handle = g.index_group_handle
+    WHERE d.database_id = DB_ID()
+    ORDER BY gs.avg_user_impact * (gs.user_seeks + gs.user_scans) DESC;
+    """
+    rows, _ = safe_query_rows(cur, q)
+    if not rows:
+        return []
+    # Build lower-case sets for both full "schema.table" and bare "table" matching.
+    # Full match is preferred; bare-name fallback catches the common case where the caller
+    # passes 'dbo.informerresponse' but the DMV returns schema_name='dbo' separately.
+    full_lower: set = set()
+    bare_lower: set = set()
+    if tables:
+        for t in tables:
+            parts = t.lower().rsplit(".", 1)
+            bare_lower.add(parts[-1])
+            full_lower.add(t.lower())
+    out = []
+    for r in rows:
+        full_key = f"{r.schema_name}.{r.table_name}".lower()
+        if full_lower and full_key not in full_lower and r.table_name.lower() not in bare_lower:
+            continue
+        out.append([
+            f"{r.schema_name}.{r.table_name}",
+            r.equality_columns or "",
+            r.inequality_columns or "",
+            r.included_columns or "",
+            r.user_seeks,
+            r.user_scans,
+            f"{r.avg_user_impact_pct}%",
+        ])
+    return out
 
 
 # =========================
@@ -1231,7 +1343,59 @@ def db_current_connections(cur: pyodbc.Cursor) -> Optional[int]:
         return None
 
 
-def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[Any]], List[List[Any]]]:
+def db_last_login_info(cur: pyodbc.Cursor) -> Dict[str, Optional[str]]:
+    """
+    Return the most recent login time and username from active sessions in this database.
+    Uses sys.dm_exec_sessions which reflects currently connected sessions.
+    """
+    q = """
+    SELECT TOP 1
+        login_name,
+        CONVERT(varchar(23), login_time, 121) AS login_time
+    FROM sys.dm_exec_sessions
+    WHERE is_user_process = 1
+      AND database_id = DB_ID()
+    ORDER BY login_time DESC;
+    """
+    row, _ = safe_query_one(cur, q)
+    if row is None:
+        return {"last_login_time": None, "last_login_user": None}
+    return {
+        "last_login_time": str(row.login_time) if row.login_time else None,
+        "last_login_user": str(row.login_name) if row.login_name else None,
+    }
+
+
+def db_last_backup_for_db(cur: pyodbc.Cursor, db_name: str) -> Dict[str, Optional[str]]:
+    """
+    Return the most recent full and log backup finish dates for *db_name* from msdb.
+    Uses fully qualified msdb reference so it works regardless of current USE context.
+    """
+    q = """
+    SELECT
+        MAX(CASE WHEN type = 'D' THEN backup_finish_date END) AS last_full,
+        MAX(CASE WHEN type = 'L' THEN backup_finish_date END) AS last_log
+    FROM msdb.dbo.backupset
+    WHERE database_name = ?;
+    """
+    row, _ = safe_query_one(cur, q, (db_name,))
+    if row is None:
+        return {"last_full_backup": None, "last_log_backup": None}
+    def _fmt(dt: Any) -> Optional[str]:
+        return str(dt) if dt else None
+    return {
+        "last_full_backup": _fmt(row.last_full),
+        "last_log_backup": _fmt(row.last_log),
+    }
+
+
+def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[Any]], List[List[Any]], List[List[Any]]]:
+    """
+    Returns (summary, notes, activity_details).
+    - summary: compact per-DB row for the truncated overview table
+    - notes: per-DB textual diagnostic notes
+    - activity_details: extended per-DB activity metrics (login, DML, backup, connections)
+    """
     dbs_q = """
     SELECT name, state_desc, is_read_only
     FROM sys.databases
@@ -1240,12 +1404,13 @@ def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[
     """
     db_rows, err = safe_query_rows(cur, dbs_q)
     if not db_rows:
-        return [], [["(error)", f"Could not enumerate databases: {err}"]]
+        return [], [["(error)", f"Could not enumerate databases: {err}"]], []
 
     start_time = server_last_start_time(cur)
 
     summary: List[List[Any]] = []
     notes: List[List[Any]] = []
+    activity_details: List[List[Any]] = []
 
     for d in db_rows:
         db_name = d.name
@@ -1256,11 +1421,14 @@ def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[
         if err_use is not None:
             summary.append([db_name, state_desc, is_read_only, "N/A", None, None, None, "Inconclusive", "LOW"])
             notes.append([db_name, f"Cannot USE database: {err_use}"])
+            activity_details.append([db_name, None, None, None, None, None, None, None])
             continue
 
         qs_act = db_query_store_activity_last_days(cur, days)
         idx_last = db_index_usage_last_activity(cur)
         cur_conn = db_current_connections(cur)
+        login_info = db_last_login_info(cur)
+        backup_info = db_last_backup_for_db(cur, db_name)
 
         qs_status = "Yes" if qs_act is True else ("No" if qs_act is False else "N/A")
 
@@ -1286,6 +1454,17 @@ def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[
             if cur_conn is not None and cur_conn > 0:
                 note_parts.append("Has current user connections.")
 
+        # Derive last_active as the most recent evidence across read, write, and login
+        _activity_times = [
+            t for t in [
+                idx_last["last_user_read"],
+                idx_last["last_user_write"],
+                login_info["last_login_time"],
+            ]
+            if t is not None
+        ]
+        last_active = max(_activity_times) if _activity_times else None
+
         summary.append(
             [
                 db_name,
@@ -1300,8 +1479,18 @@ def server_db_usage_scan(cur: pyodbc.Cursor, days: int = 30) -> Tuple[List[List[
             ]
         )
         notes.append([db_name, "; ".join(note_parts)])
+        activity_details.append([
+            db_name,
+            login_info["last_login_time"],
+            login_info["last_login_user"],
+            idx_last["last_user_write"],    # last DML
+            backup_info["last_full_backup"],
+            backup_info["last_log_backup"],
+            cur_conn,                        # current connection count as last evidence
+            last_active,
+        ])
 
-    return summary, notes
+    return summary, notes, activity_details
 
 
 # =========================
@@ -1423,6 +1612,7 @@ def build_llm_payload(
     plan_summary: Dict[str, Any],
     plan_warnings: List[str],
     table_diagnostics: Optional[Dict[str, Any]] = None,
+    missing_indexes: Optional[List[List[Any]]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "mode": mode,
@@ -1436,6 +1626,8 @@ def build_llm_payload(
     }
     if table_diagnostics:
         payload["table_diagnostics"] = table_diagnostics
+    if missing_indexes:
+        payload["missing_indexes"] = missing_indexes
     return payload
 
 
@@ -1446,13 +1638,14 @@ def build_prompt(payload: Dict[str, Any], lang: str) -> str:
     - Forces JSON-only (no markdown fences)
     - Ensures some useful content even when no issues are found
     - Provides table-mode specific analysis instructions when table_diagnostics is present
+    - Provides query-mode instructions when missing_indexes or plan_err are present
     """
     lang_line = "Write in English." if lang.lower().startswith("en") else "Write in the user's language."
     mode = payload.get("mode", "")
 
-    table_instructions = ""
+    extra_instructions = ""
     if mode == "table" and payload.get("table_diagnostics"):
-        table_instructions = f"""
+        extra_instructions = f"""
 Table analysis guidance (mode=table):
 - Examine "table_diagnostics" in the input JSON. It contains per-table data:
   * "size": row_count, total_mb, used_mb, unused_mb -- flag tables with high unused space.
@@ -1466,6 +1659,28 @@ on low page_count (< {MIN_PAGES_FOR_FRAG_ACTION} pages) as it rarely impacts per
 - Identify any statistics that are stale and recommend UPDATE STATISTICS with the specific stat names.
 - Comment on unused indexes explicitly by name.
 """
+    elif mode == "query":
+        plan_err_note = ""
+        if payload.get("estimated_plan_error"):
+            plan_err_note = (
+                "The estimated execution plan could not be obtained (see estimated_plan_error). "
+                "Use the SQL text in 'query' and 'referenced_tables' extracted from it to reason about performance. "
+            )
+        mi_note = ""
+        if payload.get("missing_indexes"):
+            mi_note = (
+                "The 'missing_indexes' field contains suggestions from sys.dm_db_missing_index_* DMVs "
+                "(columns: table, equality_cols, inequality_cols, included_cols, user_seeks, user_scans, avg_impact_pct). "
+                "Translate each missing index into a concrete CREATE INDEX statement in index_suggestions and include it in recommendations. "
+            )
+        if plan_err_note or mi_note:
+            extra_instructions = f"""
+SQL query analysis guidance (mode=query):
+- {plan_err_note}{mi_note}
+- Always provide a rewrite_suggestion if the query has table hints (e.g. TABLOCK, NOLOCK), implicit type conversions, or missing WHERE-clause sargability issues.
+- Flag TABLOCK / UPDLOCK / HOLDLOCK hints as potential blocking hazards in safety_warnings.
+- If the WHERE clause uses columns that could benefit from an index, suggest specific index DDL.
+"""
 
     return f"""
 You are a senior Microsoft SQL Server performance engineer. {lang_line}
@@ -1478,9 +1693,9 @@ Hard requirements:
 - If there are no major issues, say "No major issues detected" but still include at least 2 concrete observations from the input diagnostics.
 - "top_issues" MUST be an array (can be empty).
 - "recommendations" MUST be an array (can be empty).
-- "rewrite_suggestion" can be null.
-- "index_suggestions" MUST be an array of objects with keys "index_name", "action" (REBUILD/REORGANIZE/DROP/NONE), "reason".
-{table_instructions}
+- "rewrite_suggestion" can be null or a string containing improved T-SQL.
+- "index_suggestions" MUST be an array of objects with keys "index_name", "action" (REBUILD/REORGANIZE/DROP/CREATE/NONE), "reason".
+{extra_instructions}
 Input JSON:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
@@ -1749,6 +1964,7 @@ def run_once(argv: List[str]) -> bool:
     referenced_tables: List[str] = []
     server_info: Dict[str, Any] = {}
     db_state: Dict[str, Any] = {}
+    missing_indexes_rows: List[List[Any]] = []
 
     with connect() as conn:
         cur = conn.cursor()
@@ -1770,6 +1986,13 @@ def run_once(argv: List[str]) -> bool:
                 {f"{o.get('schema')}.{o.get('table')}" for o in referenced if o.get("schema") and o.get("table")}
             )
 
+            # When no plan is available, fall back to regex-based table extraction from SQL text
+            if not referenced_tables and plan_err:
+                referenced_tables = extract_tables_from_sql(sql_input)
+
+            # Always attempt missing-index DMV lookup (filtered to query's tables when known)
+            missing_indexes_rows = get_missing_indexes_from_dmv(cur, referenced_tables or None)
+
             sections.append(("Plan status", ["field", "value"], [["error", plan_err]] if plan_err else [["status", "OK"]]))
             sections.append(
                 (
@@ -1784,7 +2007,19 @@ def run_once(argv: List[str]) -> bool:
             )
             sections.append(("Plan operator outline (first 60)", ["physical_op", "logical_op", "estimate_rows", "est_subtree_cost"], plan_outline_rows))
             sections.append(("Plan warnings", ["warning"], [[w] for w in plan_warnings]))
-            sections.append(("Referenced tables (from plan)", ["table"], [[t] for t in referenced_tables]))
+            # Label the source so the user knows whether tables came from the plan or SQL text
+            if plan_xml and referenced_tables:
+                table_source = "from plan"
+            elif referenced_tables:
+                table_source = "extracted from SQL"
+            else:
+                table_source = "none found"
+            sections.append((f"Referenced tables ({table_source})", ["table"], [[t] for t in referenced_tables]))
+            sections.append((
+                "Missing index suggestions (DMV)",
+                ["table", "equality_cols", "inequality_cols", "included_cols", "user_seeks", "user_scans", "avg_impact"],
+                missing_indexes_rows,
+            ))
 
         elif mode == "table":
             db_state = analyze_tables(cur, tables_to_analyze)
@@ -1862,11 +2097,12 @@ def run_once(argv: List[str]) -> bool:
         elif mode == "db_usage":
             days = 30
             scope, one_db = prompt_db_usage_scope()
-            usage_summary, usage_notes = server_db_usage_scan(cur, days=days)
+            usage_summary, usage_notes, usage_activity = server_db_usage_scan(cur, days=days)
 
             if scope == "one" and one_db:
                 usage_summary = [r for r in usage_summary if str(r[0]).lower() == one_db.lower()]
                 usage_notes = [r for r in usage_notes if str(r[0]).lower() == one_db.lower()]
+                usage_activity = [r for r in usage_activity if str(r[0]).lower() == one_db.lower()]
 
             print_table_truncated(
                 f"DB Usage summary ({'single DB' if (scope=='one' and one_db) else 'all DBs'}, last {days} days) - conservative",
@@ -1875,14 +2111,26 @@ def run_once(argv: List[str]) -> bool:
                 col_max=[24, 10, 8, 4, 4, 19, 19, 12, 10],
             )
             print_table("DB Usage notes", ["db_name", "notes"], usage_notes, max_width=120)
+            print_table(
+                "DB Activity details",
+                ["db_name", "last_login_time", "last_login_user", "last_dml", "last_full_backup", "last_log_backup", "conn_count", "last_active"],
+                usage_activity,
+                max_width=120,
+            )
+            scope_label = "single DB" if (scope == "one" and one_db) else "all DBs"
             sections.append(
                 (
-                    f"DB Usage summary ({'single DB' if (scope=='one' and one_db) else 'all DBs'}, last {days} days) - conservative",
+                    f"DB Usage summary ({scope_label}, last {days} days) - conservative",
                     ["db_name", "state", "read_only", "qs", "conn", "last_read", "last_write", "unused", "confidence"],
                     usage_summary,
                 )
             )
             sections.append(("DB Usage notes", ["db_name", "notes"], usage_notes))
+            sections.append((
+                "DB Activity details",
+                ["db_name", "last_login_time", "last_login_user", "last_dml", "last_full_backup", "last_log_backup", "conn_count", "last_active"],
+                usage_activity,
+            ))
 
         # Print sections to console
         for title, headers, rows in sections:
@@ -1902,6 +2150,7 @@ def run_once(argv: List[str]) -> bool:
                     plan_summary=plan_summary,
                     plan_warnings=plan_warnings,
                     table_diagnostics=db_state if mode == "table" else None,
+                    missing_indexes=missing_indexes_rows if mode == "query" else None,
                 )
                 prompt = build_prompt(ai_payload, args.lang)
                 ai = call_ollama_json(prompt, num_predict=args.predict, debug=args.debug)
