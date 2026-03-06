@@ -1,0 +1,36 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Home page";
+}
+
+<div class="container">
+    <div class="row p-1">
+        <div class="col-1">AccessToken</div>
+        <div class="col-5"><input type="text" id="accessToken" /></div>
+    </div>
+    <div class="row p-1">
+        <div class="col-6 text-end">
+            <input type="button" id="connect" value="Connect" />
+        </div>
+    </div>
+    <div class="row p-1">
+        <div class="col">
+            <hr />
+        </div>
+    </div>
+    <div class="row p-1" id="notificationList">
+    </div>
+    <div class="row p-1">
+        <div class="col">
+            <hr />
+        </div>
+    </div>
+    <div class="row p-1">
+        <div class="col-6">
+            <ul id="messagesList"></ul>
+        </div>
+    </div>
+</div>
+<script src="~/js/signalr/signalr.js"></script>
+<script src="~/js/cnsSignalr.js"></script>
